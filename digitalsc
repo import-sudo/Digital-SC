@@ -1,0 +1,781 @@
+from __future__ import absolute_import
+import math
+import torch
+import torch.nn as nn
+from torch.autograd import Function, Variable
+import torch.nn.functional as F
+from torch.nn import init
+import pickle
+from torch.nn.parameter import Parameter
+import numpy as np
+import random
+from torch.autograd import grad
+
+__all__ = ['digitalsc']
+
+"""
+preactivation resnet with bottleneck design.
+"""
+
+class GDN(nn.Module):
+    def __init__(self, num_channels, inverse=False, beta_min=1e-6, gamma_init=0.1):
+        super(GDN, self).__init__()
+        self.inverse = inverse
+
+        self.beta = nn.Parameter(torch.ones(num_channels) * beta_min)
+        self.gamma = nn.Parameter(torch.eye(num_channels) * gamma_init)
+
+    def forward(self, x):
+        gamma = torch.abs(self.gamma)
+        beta = F.softplus(self.beta)
+        
+        norm_pool = F.conv2d(x ** 2, gamma.unsqueeze(2).unsqueeze(3), beta)
+        
+        if self.inverse:
+            out = x * torch.sqrt(norm_pool)
+        else:
+            out = x / torch.sqrt(norm_pool)
+            
+        return out
+
+class Attention(nn.Module):
+    def __init__(self, num_channels) -> None:
+        super().__init__()
+        # Global pooling
+        self.gpool = nn.AdaptiveAvgPool2d(1)
+        # linear
+        self.linear1 = nn.Linear(in_features=num_channels+1,out_features=num_channels)
+        self.linear2 = nn.Linear(in_features=num_channels,out_features=num_channels)
+        # 激活函数
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+
+    def forward(self,x,snr):
+        x_raw = x
+        # Context Extraction
+        x = self.gpool(x)
+        x = x.view(x.shape[0],-1)
+        snr_tensor = snr * torch.ones((x.shape[0],1)).to(x.device)
+        x = torch.cat([snr_tensor,x],dim=1)
+        # Factor Prediction
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        x = self.sigmoid(x)
+        # Feature Recalibration
+        x = x.unsqueeze(-1).unsqueeze(-1)
+        x = x.expand(x_raw.size())
+        x = x * x_raw
+
+        return x
+
+class PixelShuffle(nn.Module):
+    def __init__(self, upscale_factor=2):
+        super(PixelShuffle, self).__init__()
+        self.upscale_factor = upscale_factor
+
+    def forward(self, x):
+        batch_size, channels, in_height, in_width = x.size()
+        out_channels = channels // (self.upscale_factor ** 2)
+        out_height = in_height * self.upscale_factor
+        out_width = in_width * self.upscale_factor
+
+        # Reshape and permute the input tensor to upscale it
+        x = x.view(batch_size, out_channels, self.upscale_factor, self.upscale_factor, in_height, in_width)
+        x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
+        x = x.view(batch_size, out_channels, out_height, out_width)
+
+        return x
+
+class Residual_block(nn.Module):
+
+    def __init__(self, num_channels):
+        super(Residual_block, self).__init__()
+
+        self.conv1 = nn.Sequential(
+                nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+                nn.LeakyReLU(0.1),
+            )
+
+        self.conv2 = nn.Sequential(
+                nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+                nn.LeakyReLU(0.1),
+            )   
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+
+        out += residual
+        return out
+
+class Residual_block_down(nn.Module):
+
+    def __init__(self, input_channel, output_channel):
+        super(Residual_block_down, self).__init__()
+
+        self.conv1 = nn.Sequential(
+                nn.Conv2d(input_channel, output_channel, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+                nn.LeakyReLU(0.1),
+                nn.Conv2d(output_channel, output_channel, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+                GDN(output_channel)
+            )   
+
+        self.conv2 = nn.Sequential(
+                nn.Conv2d(input_channel, output_channel, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+                nn.LeakyReLU(0.1),            
+            )
+
+    def forward(self, x):
+        residual = self.conv2(x)
+        out = self.conv1(x)
+
+        out += residual
+        return out
+
+class Residual_block_up(nn.Module):
+
+    def __init__(self, input_channel, output_channel):
+        super(Residual_block_up, self).__init__()
+
+        self.conv1 = nn.Sequential(
+                nn.Conv2d(input_channel, input_channel, kernel_size=3, stride=2,
+                               padding=1, bias=False),
+                PixelShuffle(2),
+                nn.LeakyReLU(0.1),
+
+                nn.Conv2d(input_channel//4, output_channel, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+                GDN(output_channel)
+
+            )
+
+        self.conv2 = nn.Sequential(
+                nn.Conv2d(input_channel, input_channel, kernel_size=3, stride=2,
+                               padding=1, bias=False),
+                PixelShuffle(2),
+                nn.Conv2d(input_channel//4, output_channel, kernel_size=3, stride=1,
+                               padding=1, bias=False),
+            )  
+
+        # self.con = PixelShuffle(2) 
+
+    def forward(self, x):
+        residual = self.conv2(x)
+        out = self.conv1(x)
+
+        out += residual
+        return out
+
+class Quantization(nn.Module):
+    def __init__(self,nbit=2):
+        super(Quantization, self).__init__()
+        self.num_quantization_level = 2 ** nbit
+
+        biases = torch.rand(self.num_quantization_level)*2 - 1
+        biases, _ = torch.sort(biases)
+
+        self.biases = Parameter(biases)
+
+    def forward(self, input, bit_error, T):
+
+        output = SigmoidT.apply(input, self.biases, self.num_quantization_level, T).float()
+        output = digital_channel.apply(output, self.biases, self.num_quantization_level, bit_error).float()
+
+        return output
+
+class digital_channel(torch.autograd.Function):
+
+    @staticmethod
+    def forward(self, input, biases, num_quantization_level, bit_error): 
+        self.biases = biases
+        output = torch.zeros_like(input).to(input.device).float()
+        temp_masks = []
+        for i in range(num_quantization_level-1):
+            temp_mask = torch.gt(output, input - (self.biases[i]+self.biases[i+1])/2)
+            temp_masks.append(temp_mask)
+
+        masks = []
+        for i in range(len(temp_masks)):
+            if i == 0:
+                mask = 1-temp_masks[-1].float()
+            else:
+                mask = temp_masks[i].float() - temp_masks[i-1].float()
+            masks.append(mask)
+        A = masks[0] + masks[2]
+        B = masks[0] + masks[1]
+
+        bit_seq = torch.cat((A,B),dim=0)
+        batch,channel,W,H = bit_seq.shape
+
+        ############# BSC 信道 ####################################
+        # error_matrix = torch.gt(torch.zeros_like(bit_seq).to(A.device), torch.rand(bit_seq.shape).to(A.device)-bit_error)  
+        # hat_bit_seq = torch.abs(bit_seq-error_matrix.float())
+        #############BSC 信道####################################
+
+        # ##############调制 + AWGN 信道####################################
+        bits = bit_seq.reshape(-1).cpu().detach().numpy()
+        modulated_symbols, modulation_table, Remainder = modulate(bits.astype(int), '4QAM')
+        # 添加噪声
+        symbols_with_noise = add_noise(modulated_symbols, bit_error)
+        # 16QAM解调
+        output_bits = demodulate(symbols_with_noise, modulation_table, Remainder)
+        hat_bit_seq = torch.tensor(output_bits, dtype=torch.float32).reshape(batch,channel,W,H).to(A.device)
+        # ##############调制 + AWGN 信道####################################
+
+        hat_feature_temp = 10*hat_bit_seq[:int(batch/2),::,::,::] + hat_bit_seq[int(batch/2):,::,::,::]
+        
+        hat_thre = [0, 1, 10, 11]
+        
+        for j in range(len(hat_thre)):
+            hat_temp_mask = torch.eq(hat_feature_temp, hat_thre[j])
+            output += hat_temp_mask*self.biases[j]
+        return output
+
+    @staticmethod
+    def backward(self, grad_output):
+        return grad_output, None, None, None
+
+class SigmoidT(torch.autograd.Function):
+    """ sigmoid with temperature T for training
+        we need the gradients for input and bias
+        for customization of function, refer to https://pytorch.org/docs/stable/notes/extending.html
+    """
+
+    @staticmethod
+    def forward(self, input, biases, n_sigmoid, T): 
+        self.save_for_backward(input)
+        self.T = T
+        self.biases = biases
+        self.n_sigmoid = n_sigmoid
+
+        output = torch.zeros_like(input).to(input.device).float()
+        if T < 100:
+            for i in range(1,self.n_sigmoid):
+                buf = self.T * (input - self.biases[i])
+                output += (self.biases[i] - self.biases[i-1]) / (1.0 + torch.exp(-buf))
+        else:
+            for i in range(1,self.n_sigmoid):
+                mask = torch.gt(input - self.biases[i],  0.0)
+                output += mask.mul((self.biases[i] - self.biases[i-1]))
+        output += self.biases[0]
+
+        return output
+
+    @staticmethod
+    def backward(self, grad_output):
+        input, = self.saved_tensors
+        grad_output = grad_output.float()
+        grad_bias = torch.ones(self.n_sigmoid).to(input.device).float()
+        # print('biases',self.biases)
+        b_buf1 = self.T * (input - self.biases[1])
+        b_output1 = 1 / (1.0 + torch.exp(-b_buf1))
+
+        temp_input = torch.zeros_like(input).to(input.device).float()
+        grad_bias[0] = ((1-b_output1) * grad_output).sum()
+        for j in range(1, (self.n_sigmoid-1)):        
+            # b_buf = torch.clamp(self.T * (input - self.biases[0]), min=-10.0, max=10.0)
+            b_buf1 = self.T * (input - self.biases[j+1])
+            b_output1 = 1 / (1.0 + torch.exp(-b_buf1))
+
+            b_buf0 = self.T * (input - self.biases[j])
+            b_output0 = 1 / (1.0 + torch.exp(-b_buf0))
+
+            temp_bias = b_output0 - b_output1 - self.T * b_output0 * (1-b_output0) * (self.biases[j]-self.biases[j-1])
+            temp_input += self.T * b_output0 * (1-b_output0) * (self.biases[j]-self.biases[j-1])
+            # temp_scale = b_output
+
+            grad_bias[j] = (temp_bias * grad_output).sum()
+            # grad_scale[j] = (temp_scale * grad_output).sum()
+
+        b_buf0 = self.T * (input - self.biases[-1])
+        b_output0 = 1 / (1.0 + torch.exp(-b_buf0))
+        temp_bias = b_output0 - self.T * b_output0 * (1-b_output0) * (self.biases[-1]-self.biases[-2])
+        grad_bias[-1] = (temp_bias * grad_output).sum()
+        
+        temp_input += self.T * b_output0 * (1-b_output0) * (self.biases[-1]-self.biases[-2])
+        grad_input = Variable(temp_input) * grad_output   
+
+        # corresponding to grad_input
+        # print('grad',grad_bias)
+        return grad_input, grad_bias, None, None
+
+
+class digitalsc(nn.Module):
+    def __init__(self, transmit_channel=40, output_channel=256, modulation_mode = '16QAM'):
+        super(digitalsc, self).__init__()
+
+        self.encoder_1 = nn.Sequential(
+                Residual_block_down(3, output_channel),
+                Residual_block(output_channel),
+                Residual_block_down(output_channel, output_channel),
+            )
+
+        self.atten_1 = Attention(output_channel)
+
+        self.encoder_2 = nn.Sequential(
+                Residual_block(output_channel),
+                Residual_block_down(output_channel, output_channel),
+                Residual_block(output_channel),
+                Residual_block_down(output_channel, transmit_channel),
+            )
+
+        self.atten_2 = Attention(transmit_channel)
+
+        self.atten_3 = Attention(transmit_channel)
+
+        self.decoder_1 = nn.Sequential(
+                Residual_block(transmit_channel),
+                Residual_block_up(transmit_channel, output_channel),
+                Residual_block(output_channel),
+                Residual_block_up(output_channel, output_channel),
+            )
+
+        self.atten_4 = Attention(output_channel)
+
+        self.decoder_2 = nn.Sequential(                
+                Residual_block(output_channel),
+                Residual_block_up(output_channel, output_channel),
+                Residual_block(output_channel),
+                Residual_block_up(output_channel, 3)
+            )
+
+        self.digtal = Quantization()
+
+    def forward(self, x, snr=6, T=1000, digtal=False):
+        x = self.encoder_1(x)
+        x = self.atten_1(x, snr)
+
+        x = self.encoder_2(x)
+        x = self.atten_2(x, snr)
+
+        x = self.digtal(x, snr, T)
+
+        x = self.atten_3(x, snr)
+        x = self.decoder_1(x)
+
+        x = self.atten_4(x, snr)
+        x = self.decoder_2(x)
+
+        return x
+
+
+def modulate(bits, modulation_mode):
+
+    modulation_4QAM_table = {
+        (0, 0): complex(-1, -1),
+        (0, 1): complex(-1, 1),
+        (1, 0): complex(1, -1),
+        (1, 1): complex(1, 1),
+    }
+
+    modulation_16QAM_table = {
+        (0, 0, 0, 0): complex(-3, -3),
+        (0, 0, 0, 1): complex(-3, -1),
+        (0, 0, 1, 0): complex(-3, 3),
+        (0, 0, 1, 1): complex(-3, 1),
+        (0, 1, 0, 0): complex(-1, -3),
+        (0, 1, 0, 1): complex(-1, -1),
+        (0, 1, 1, 0): complex(-1, 3),
+        (0, 1, 1, 1): complex(-1, 1),
+        (1, 0, 0, 0): complex(3, -3),
+        (1, 0, 0, 1): complex(3, -1),
+        (1, 0, 1, 0): complex(3, 3),
+        (1, 0, 1, 1): complex(3, 1),
+        (1, 1, 0, 0): complex(1, -3),
+        (1, 1, 0, 1): complex(1, -1),
+        (1, 1, 1, 0): complex(1, 3),
+        (1, 1, 1, 1): complex(1, 1)
+    }
+
+    modulation_64QAM_table = {
+        (0, 0, 0, 0, 0, 0): complex(-7, -7),
+        (0, 0, 0, 0, 0, 1): complex(-7, -5),
+        (0, 0, 0, 0, 1, 0): complex(-7, -3),
+        (0, 0, 0, 0, 1, 1): complex(-7, -1),
+        (0, 0, 0, 1, 0, 0): complex(-7, 7),
+        (0, 0, 0, 1, 0, 1): complex(-7, 5),
+        (0, 0, 0, 1, 1, 0): complex(-7, 3),
+        (0, 0, 0, 1, 1, 1): complex(-7, 1),
+        (0, 0, 1, 0, 0, 0): complex(-5, -7),
+        (0, 0, 1, 0, 0, 1): complex(-5, -5),
+        (0, 0, 1, 0, 1, 0): complex(-5, -3),
+        (0, 0, 1, 0, 1, 1): complex(-5, -1),
+        (0, 0, 1, 1, 0, 0): complex(-5, 7),
+        (0, 0, 1, 1, 0, 1): complex(-5, 5),
+        (0, 0, 1, 1, 1, 0): complex(-5, 3),
+        (0, 0, 1, 1, 1, 1): complex(-5, 1),
+        (0, 1, 0, 0, 0, 0): complex(-3, -7),
+        (0, 1, 0, 0, 0, 1): complex(-3, -5),
+        (0, 1, 0, 0, 1, 0): complex(-3, -3),
+        (0, 1, 0, 0, 1, 1): complex(-3, -1),
+        (0, 1, 0, 1, 0, 0): complex(-3, 7),
+        (0, 1, 0, 1, 0, 1): complex(-3, 5),
+        (0, 1, 0, 1, 1, 0): complex(-3, 3),
+        (0, 1, 0, 1, 1, 1): complex(-3, 1),
+        (0, 1, 1, 0, 0, 0): complex(-1, -7),
+        (0, 1, 1, 0, 0, 1): complex(-1, -5),
+        (0, 1, 1, 0, 1, 0): complex(-1, -3),
+        (0, 1, 1, 0, 1, 1): complex(-1, -1),
+        (0, 1, 1, 1, 0, 0): complex(-1, 7),
+        (0, 1, 1, 1, 0, 1): complex(-1, 5),
+        (0, 1, 1, 1, 1, 0): complex(-1, 3),
+        (0, 1, 1, 1, 1, 1): complex(-1, 1),
+        (1, 0, 0, 0, 0, 0): complex(7, -7),
+        (1, 0, 0, 0, 0, 1): complex(7, -5),
+        (1, 0, 0, 0, 1, 0): complex(7, -3),
+        (1, 0, 0, 0, 1, 1): complex(7, -1),
+        (1, 0, 0, 1, 0, 0): complex(7, 7),
+        (1, 0, 0, 1, 0, 1): complex(7, 5),
+        (1, 0, 0, 1, 1, 0): complex(7, 3),
+        (1, 0, 0, 1, 1, 1): complex(7, 1),
+        (1, 0, 1, 0, 0, 0): complex(5, -7),
+        (1, 0, 1, 0, 0, 1): complex(5, -5),
+        (1, 0, 1, 0, 1, 0): complex(5, -3),
+        (1, 0, 1, 0, 1, 1): complex(5, -1),
+        (1, 0, 1, 1, 0, 0): complex(5, 7),
+        (1, 0, 1, 1, 0, 1): complex(5, 5),
+        (1, 0, 1, 1, 1, 0): complex(5, 3),
+        (1, 0, 1, 1, 1, 1): complex(5, 1),
+        (1, 1, 0, 0, 0, 0): complex(3, -7),
+        (1, 1, 0, 0, 0, 1): complex(3, -5),
+        (1, 1, 0, 0, 1, 0): complex(3, -3),
+        (1, 1, 0, 0, 1, 1): complex(3, -1),
+        (1, 1, 0, 1, 0, 0): complex(3, 7),
+        (1, 1, 0, 1, 0, 1): complex(3, 5),
+        (1, 1, 0, 1, 1, 0): complex(3, 3),
+        (1, 1, 0, 1, 1, 1): complex(3, 1),
+        (1, 1, 1, 0, 0, 0): complex(1, -7),
+        (1, 1, 1, 0, 0, 1): complex(1, -5),
+        (1, 1, 1, 0, 1, 0): complex(1, -3),
+        (1, 1, 1, 0, 1, 1): complex(1, -1),
+        (1, 1, 1, 1, 0, 0): complex(1, 7),
+        (1, 1, 1, 1, 0, 1): complex(1, 5),
+        (1, 1, 1, 1, 1, 0): complex(1, 3),
+        (1, 1, 1, 1, 1, 1): complex(1, 1)
+    }
+
+    # 定义16QAM解调映射表（取最近的16QAM符号）
+
+    modulation_256QAM_table = {
+        (0, 0, 0, 0, 0, 0, 0, 0): complex(-15, -15),
+        (0, 0, 0, 0, 0, 0, 0, 1): complex(-15, -13),
+        (0, 0, 0, 0, 0, 0, 1, 0): complex(-15, -11),
+        (0, 0, 0, 0, 0, 0, 1, 1): complex(-15, -9),
+        (0, 0, 0, 0, 0, 1, 0, 0): complex(-15, -7),
+        (0, 0, 0, 0, 0, 1, 0, 1): complex(-15, -5),
+        (0, 0, 0, 0, 0, 1, 1, 0): complex(-15, -3),
+        (0, 0, 0, 0, 0, 1, 1, 1): complex(-15, -1),
+        (0, 0, 0, 0, 1, 0, 0, 0): complex(-15, 1),
+        (0, 0, 0, 0, 1, 0, 0, 1): complex(-15, 3),
+        (0, 0, 0, 0, 1, 0, 1, 0): complex(-15, 5),
+        (0, 0, 0, 0, 1, 0, 1, 1): complex(-15, 7),
+        (0, 0, 0, 0, 1, 1, 0, 0): complex(-15, 9),
+        (0, 0, 0, 0, 1, 1, 0, 1): complex(-15, 11),
+        (0, 0, 0, 0, 1, 1, 1, 0): complex(-15, 13),
+        (0, 0, 0, 0, 1, 1, 1, 1): complex(-15, 15),
+        (0, 0, 0, 1, 0, 0, 0, 0): complex(-13, -15),
+        (0, 0, 0, 1, 0, 0, 0, 1): complex(-13, -13),
+        (0, 0, 0, 1, 0, 0, 1, 0): complex(-13, -11),
+        (0, 0, 0, 1, 0, 0, 1, 1): complex(-13, -9),
+        (0, 0, 0, 1, 0, 1, 0, 0): complex(-13, -7),
+        (0, 0, 0, 1, 0, 1, 0, 1): complex(-13, -5),
+        (0, 0, 0, 1, 0, 1, 1, 0): complex(-13, -3),
+        (0, 0, 0, 1, 0, 1, 1, 1): complex(-13, -1),
+        (0, 0, 0, 1, 1, 0, 0, 0): complex(-13, 1),
+        (0, 0, 0, 1, 1, 0, 0, 1): complex(-13, 3),
+        (0, 0, 0, 1, 1, 0, 1, 0): complex(-13, 5),
+        (0, 0, 0, 1, 1, 0, 1, 1): complex(-13, 7),
+        (0, 0, 0, 1, 1, 1, 0, 0): complex(-13, 9),
+        (0, 0, 0, 1, 1, 1, 0, 1): complex(-13, 11),
+        (0, 0, 0, 1, 1, 1, 1, 0): complex(-13, 13),
+        (0, 0, 0, 1, 1, 1, 1, 1): complex(-13, 15),
+        (0, 0, 1, 0, 0, 0, 0, 0): complex(-11, -15),
+        (0, 0, 1, 0, 0, 0, 0, 1): complex(-11, -13),
+        (0, 0, 1, 0, 0, 0, 1, 0): complex(-11, -11),
+        (0, 0, 1, 0, 0, 0, 1, 1): complex(-11, -9),
+        (0, 0, 1, 0, 0, 1, 0, 0): complex(-11, -7),
+        (0, 0, 1, 0, 0, 1, 0, 1): complex(-11, -5),
+        (0, 0, 1, 0, 0, 1, 1, 0): complex(-11, -3),
+        (0, 0, 1, 0, 0, 1, 1, 1): complex(-11, -1),
+        (0, 0, 1, 0, 1, 0, 0, 0): complex(-11, 1),
+        (0, 0, 1, 0, 1, 0, 0, 1): complex(-11, 3),
+        (0, 0, 1, 0, 1, 0, 1, 0): complex(-11, 5),
+        (0, 0, 1, 0, 1, 0, 1, 1): complex(-11, 7),
+        (0, 0, 1, 0, 1, 1, 0, 0): complex(-11, 9),
+        (0, 0, 1, 0, 1, 1, 0, 1): complex(-11, 11),
+        (0, 0, 1, 0, 1, 1, 1, 0): complex(-11, 13),
+        (0, 0, 1, 0, 1, 1, 1, 1): complex(-11, 15),
+        (0, 0, 1, 1, 0, 0, 0, 0): complex(-9, -15),
+        (0, 0, 1, 1, 0, 0, 0, 1): complex(-9, -13),
+        (0, 0, 1, 1, 0, 0, 1, 0): complex(-9, -11),
+        (0, 0, 1, 1, 0, 0, 1, 1): complex(-9, -9),
+        (0, 0, 1, 1, 0, 1, 0, 0): complex(-9, -7),
+        (0, 0, 1, 1, 0, 1, 0, 1): complex(-9, -5),
+        (0, 0, 1, 1, 0, 1, 1, 0): complex(-9, -3),
+        (0, 0, 1, 1, 0, 1, 1, 1): complex(-9, -1),
+        (0, 0, 1, 1, 1, 0, 0, 0): complex(-9, 1),
+        (0, 0, 1, 1, 1, 0, 0, 1): complex(-9, 3),
+        (0, 0, 1, 1, 1, 0, 1, 0): complex(-9, 5),
+        (0, 0, 1, 1, 1, 0, 1, 1): complex(-9, 7),
+        (0, 0, 1, 1, 1, 1, 0, 0): complex(-9, 9),
+        (0, 0, 1, 1, 1, 1, 0, 1): complex(-9, 11),
+        (0, 0, 1, 1, 1, 1, 1, 0): complex(-9, 13),
+        (0, 0, 1, 1, 1, 1, 1, 1): complex(-9, 15),
+        (0, 1, 0, 0, 0, 0, 0, 0): complex(-7, -15),
+        (0, 1, 0, 0, 0, 0, 0, 1): complex(-7, -13),
+        (0, 1, 0, 0, 0, 0, 1, 0): complex(-7, -11),
+        (0, 1, 0, 0, 0, 0, 1, 1): complex(-7, -9),
+        (0, 1, 0, 0, 0, 1, 0, 0): complex(-7, -7),
+        (0, 1, 0, 0, 0, 1, 0, 1): complex(-7, -5),
+        (0, 1, 0, 0, 0, 1, 1, 0): complex(-7, -3),
+        (0, 1, 0, 0, 0, 1, 1, 1): complex(-7, -1),
+        (0, 1, 0, 0, 1, 0, 0, 0): complex(-7, 1),
+        (0, 1, 0, 0, 1, 0, 0, 1): complex(-7, 3),
+        (0, 1, 0, 0, 1, 0, 1, 0): complex(-7, 5),
+        (0, 1, 0, 0, 1, 0, 1, 1): complex(-7, 7),
+        (0, 1, 0, 0, 1, 1, 0, 0): complex(-7, 9),
+        (0, 1, 0, 0, 1, 1, 0, 1): complex(-7, 11),
+        (0, 1, 0, 0, 1, 1, 1, 0): complex(-7, 13),
+        (0, 1, 0, 0, 1, 1, 1, 1): complex(-7, 15),
+        (0, 1, 0, 1, 0, 0, 0, 0): complex(-5, -15),
+        (0, 1, 0, 1, 0, 0, 0, 1): complex(-5, -13),
+        (0, 1, 0, 1, 0, 0, 1, 0): complex(-5, -11),
+        (0, 1, 0, 1, 0, 0, 1, 1): complex(-5, -9),
+        (0, 1, 0, 1, 0, 1, 0, 0): complex(-5, -7),
+        (0, 1, 0, 1, 0, 1, 0, 1): complex(-5, -5),
+        (0, 1, 0, 1, 0, 1, 1, 0): complex(-5, -3),
+        (0, 1, 0, 1, 0, 1, 1, 1): complex(-5, -1),
+        (0, 1, 0, 1, 1, 0, 0, 0): complex(-5, 1),
+        (0, 1, 0, 1, 1, 0, 0, 1): complex(-5, 3),
+        (0, 1, 0, 1, 1, 0, 1, 0): complex(-5, 5),
+        (0, 1, 0, 1, 1, 0, 1, 1): complex(-5, 7),
+        (0, 1, 0, 1, 1, 1, 0, 0): complex(-5, 9),
+        (0, 1, 0, 1, 1, 1, 0, 1): complex(-5, 11),
+        (0, 1, 0, 1, 1, 1, 1, 0): complex(-5, 13),
+        (0, 1, 0, 1, 1, 1, 1, 1): complex(-5, 15),
+        (0, 1, 1, 0, 0, 0, 0, 0): complex(-3, -15),
+        (0, 1, 1, 0, 0, 0, 0, 1): complex(-3, -13),
+        (0, 1, 1, 0, 0, 0, 1, 0): complex(-3, -11),
+        (0, 1, 1, 0, 0, 0, 1, 1): complex(-3, -9),
+        (0, 1, 1, 0, 0, 1, 0, 0): complex(-3, -7),
+        (0, 1, 1, 0, 0, 1, 0, 1): complex(-3, -5),
+        (0, 1, 1, 0, 0, 1, 1, 0): complex(-3, -3),
+        (0, 1, 1, 0, 0, 1, 1, 1): complex(-3, -1),
+        (0, 1, 1, 0, 1, 0, 0, 0): complex(-3, 1),
+        (0, 1, 1, 0, 1, 0, 0, 1): complex(-3, 3),
+        (0, 1, 1, 0, 1, 0, 1, 0): complex(-3, 5),
+        (0, 1, 1, 0, 1, 0, 1, 1): complex(-3, 7),
+        (0, 1, 1, 0, 1, 1, 0, 0): complex(-3, 9),
+        (0, 1, 1, 0, 1, 1, 0, 1): complex(-3, 11),
+        (0, 1, 1, 0, 1, 1, 1, 0): complex(-3, 13),
+        (0, 1, 1, 0, 1, 1, 1, 1): complex(-3, 15),
+        (0, 1, 1, 1, 0, 0, 0, 0): complex(-1, -15),
+        (0, 1, 1, 1, 0, 0, 0, 1): complex(-1, -13),
+        (0, 1, 1, 1, 0, 0, 1, 0): complex(-1, -11),
+        (0, 1, 1, 1, 0, 0, 1, 1): complex(-1, -9),
+        (0, 1, 1, 1, 0, 1, 0, 0): complex(-1, -7),
+        (0, 1, 1, 1, 0, 1, 0, 1): complex(-1, -5),
+        (0, 1, 1, 1, 0, 1, 1, 0): complex(-1, -3),
+        (0, 1, 1, 1, 0, 1, 1, 1): complex(-1, -1),
+        (0, 1, 1, 1, 1, 0, 0, 0): complex(-1, 1),
+        (0, 1, 1, 1, 1, 0, 0, 1): complex(-1, 3),
+        (0, 1, 1, 1, 1, 0, 1, 0): complex(-1, 5),
+        (0, 1, 1, 1, 1, 0, 1, 1): complex(-1, 7),
+        (0, 1, 1, 1, 1, 1, 0, 0): complex(-1, 9),
+        (0, 1, 1, 1, 1, 1, 0, 1): complex(-1, 11),
+        (0, 1, 1, 1, 1, 1, 1, 0): complex(-1, 13),
+        (0, 1, 1, 1, 1, 1, 1, 1): complex(-1, 15),
+        (1, 0, 0, 0, 0, 0, 0, 0): complex(15, -15),
+        (1, 0, 0, 0, 0, 0, 0, 1): complex(15, -13),
+        (1, 0, 0, 0, 0, 0, 1, 0): complex(15, -11),
+        (1, 0, 0, 0, 0, 0, 1, 1): complex(15, -9),
+        (1, 0, 0, 0, 0, 1, 0, 0): complex(15, -7),
+        (1, 0, 0, 0, 0, 1, 0, 1): complex(15, -5),
+        (1, 0, 0, 0, 0, 1, 1, 0): complex(15, -3),
+        (1, 0, 0, 0, 0, 1, 1, 1): complex(15, -1),
+        (1, 0, 0, 0, 1, 0, 0, 0): complex(15, 1),
+        (1, 0, 0, 0, 1, 0, 0, 1): complex(15, 3),
+        (1, 0, 0, 0, 1, 0, 1, 0): complex(15, 5),
+        (1, 0, 0, 0, 1, 0, 1, 1): complex(15, 7),
+        (1, 0, 0, 0, 1, 1, 0, 0): complex(15, 9),
+        (1, 0, 0, 0, 1, 1, 0, 1): complex(15, 11),
+        (1, 0, 0, 0, 1, 1, 1, 0): complex(15, 13),
+        (1, 0, 0, 0, 1, 1, 1, 1): complex(15, 15),
+        (1, 0, 0, 1, 0, 0, 0, 0): complex(13, -15),
+        (1, 0, 0, 1, 0, 0, 0, 1): complex(13, -13),
+        (1, 0, 0, 1, 0, 0, 1, 0): complex(13, -11),
+        (1, 0, 0, 1, 0, 0, 1, 1): complex(13, -9),
+        (1, 0, 0, 1, 0, 1, 0, 0): complex(13, -7),
+        (1, 0, 0, 1, 0, 1, 0, 1): complex(13, -5),
+        (1, 0, 0, 1, 0, 1, 1, 0): complex(13, -3),
+        (1, 0, 0, 1, 0, 1, 1, 1): complex(13, -1),
+        (1, 0, 0, 1, 1, 0, 0, 0): complex(13, 1),
+        (1, 0, 0, 1, 1, 0, 0, 1): complex(13, 3),
+        (1, 0, 0, 1, 1, 0, 1, 0): complex(13, 5),
+        (1, 0, 0, 1, 1, 0, 1, 1): complex(13, 7),
+        (1, 0, 0, 1, 1, 1, 0, 0): complex(13, 9),
+        (1, 0, 0, 1, 1, 1, 0, 1): complex(13, 11),
+        (1, 0, 0, 1, 1, 1, 1, 0): complex(13, 13),
+        (1, 0, 0, 1, 1, 1, 1, 1): complex(13, 15),
+        (1, 0, 1, 0, 0, 0, 0, 0): complex(11, -15),
+        (1, 0, 1, 0, 0, 0, 0, 1): complex(11, -13),
+        (1, 0, 1, 0, 0, 0, 1, 0): complex(11, -11),
+        (1, 0, 1, 0, 0, 0, 1, 1): complex(11, -9),
+        (1, 0, 1, 0, 0, 1, 0, 0): complex(11, -7),
+        (1, 0, 1, 0, 0, 1, 0, 1): complex(11, -5),
+        (1, 0, 1, 0, 0, 1, 1, 0): complex(11, -3),
+        (1, 0, 1, 0, 0, 1, 1, 1): complex(11, -1),
+        (1, 0, 1, 0, 1, 0, 0, 0): complex(11, 1),
+        (1, 0, 1, 0, 1, 0, 0, 1): complex(11, 3),
+        (1, 0, 1, 0, 1, 0, 1, 0): complex(11, 5),
+        (1, 0, 1, 0, 1, 0, 1, 1): complex(11, 7),
+        (1, 0, 1, 0, 1, 1, 0, 0): complex(11, 9),
+        (1, 0, 1, 0, 1, 1, 0, 1): complex(11, 11),
+        (1, 0, 1, 0, 1, 1, 1, 0): complex(11, 13),
+        (1, 0, 1, 0, 1, 1, 1, 1): complex(11, 15),
+        (1, 0, 1, 1, 0, 0, 0, 0): complex(9, -15),
+        (1, 0, 1, 1, 0, 0, 0, 1): complex(9, -13),
+        (1, 0, 1, 1, 0, 0, 1, 0): complex(9, -11),
+        (1, 0, 1, 1, 0, 0, 1, 1): complex(9, -9),
+        (1, 0, 1, 1, 0, 1, 0, 0): complex(9, -7),
+        (1, 0, 1, 1, 0, 1, 0, 1): complex(9, -5),
+        (1, 0, 1, 1, 0, 1, 1, 0): complex(9, -3),
+        (1, 0, 1, 1, 0, 1, 1, 1): complex(9, -1),
+        (1, 0, 1, 1, 1, 0, 0, 0): complex(9, 1),
+        (1, 0, 1, 1, 1, 0, 0, 1): complex(9, 3),
+        (1, 0, 1, 1, 1, 0, 1, 0): complex(9, 5),
+        (1, 0, 1, 1, 1, 0, 1, 1): complex(9, 7),
+        (1, 0, 1, 1, 1, 1, 0, 0): complex(9, 9),
+        (1, 0, 1, 1, 1, 1, 0, 1): complex(9, 11),
+        (1, 0, 1, 1, 1, 1, 1, 0): complex(9, 13),
+        (1, 0, 1, 1, 1, 1, 1, 1): complex(9, 15),
+        (1, 1, 0, 0, 0, 0, 0, 0): complex(7, -15),
+        (1, 1, 0, 0, 0, 0, 0, 1): complex(7, -13),
+        (1, 1, 0, 0, 0, 0, 1, 0): complex(7, -11),
+        (1, 1, 0, 0, 0, 0, 1, 1): complex(7, -9),
+        (1, 1, 0, 0, 0, 1, 0, 0): complex(7, -7),
+        (1, 1, 0, 0, 0, 1, 0, 1): complex(7, -5),
+        (1, 1, 0, 0, 0, 1, 1, 0): complex(7, -3),
+        (1, 1, 0, 0, 0, 1, 1, 1): complex(7, -1),
+        (1, 1, 0, 0, 1, 0, 0, 0): complex(7, 1),
+        (1, 1, 0, 0, 1, 0, 0, 1): complex(7, 3),
+        (1, 1, 0, 0, 1, 0, 1, 0): complex(7, 5),
+        (1, 1, 0, 0, 1, 0, 1, 1): complex(7, 7),
+        (1, 1, 0, 0, 1, 1, 0, 0): complex(7, 9),
+        (1, 1, 0, 0, 1, 1, 0, 1): complex(7, 11),
+        (1, 1, 0, 0, 1, 1, 1, 0): complex(7, 13),
+        (1, 1, 0, 0, 1, 1, 1, 1): complex(7, 15),
+        (1, 1, 0, 1, 0, 0, 0, 0): complex(5, -15),
+        (1, 1, 0, 1, 0, 0, 0, 1): complex(5, -13),
+        (1, 1, 0, 1, 0, 0, 1, 0): complex(5, -11),
+        (1, 1, 0, 1, 0, 0, 1, 1): complex(5, -9),
+        (1, 1, 0, 1, 0, 1, 0, 0): complex(5, -7),
+        (1, 1, 0, 1, 0, 1, 0, 1): complex(5, -5),
+        (1, 1, 0, 1, 0, 1, 1, 0): complex(5, -3),
+        (1, 1, 0, 1, 0, 1, 1, 1): complex(5, -1),
+        (1, 1, 0, 1, 1, 0, 0, 0): complex(5, 1),
+        (1, 1, 0, 1, 1, 0, 0, 1): complex(5, 3),
+        (1, 1, 0, 1, 1, 0, 1, 0): complex(5, 5),
+        (1, 1, 0, 1, 1, 0, 1, 1): complex(5, 7),
+        (1, 1, 0, 1, 1, 1, 0, 0): complex(5, 9),
+        (1, 1, 0, 1, 1, 1, 0, 1): complex(5, 11),
+        (1, 1, 0, 1, 1, 1, 1, 0): complex(5, 13),
+        (1, 1, 0, 1, 1, 1, 1, 1): complex(5, 15),
+        (1, 1, 1, 0, 0, 0, 0, 0): complex(3, -15),
+        (1, 1, 1, 0, 0, 0, 0, 1): complex(3, -13),
+        (1, 1, 1, 0, 0, 0, 1, 0): complex(3, -11),
+        (1, 1, 1, 0, 0, 0, 1, 1): complex(3, -9),
+        (1, 1, 1, 0, 0, 1, 0, 0): complex(3, -7),
+        (1, 1, 1, 0, 0, 1, 0, 1): complex(3, -5),
+        (1, 1, 1, 0, 0, 1, 1, 0): complex(3, -3),
+        (1, 1, 1, 0, 0, 1, 1, 1): complex(3, -1),
+        (1, 1, 1, 0, 1, 0, 0, 0): complex(3, 1),
+        (1, 1, 1, 0, 1, 0, 0, 1): complex(3, 3),
+        (1, 1, 1, 0, 1, 0, 1, 0): complex(3, 5),
+        (1, 1, 1, 0, 1, 0, 1, 1): complex(3, 7),
+        (1, 1, 1, 0, 1, 1, 0, 0): complex(3, 9),
+        (1, 1, 1, 0, 1, 1, 0, 1): complex(3, 11),
+        (1, 1, 1, 0, 1, 1, 1, 0): complex(3, 13),
+        (1, 1, 1, 0, 1, 1, 1, 1): complex(3, 15),
+        (1, 1, 1, 1, 0, 0, 0, 0): complex(1, -15),
+        (1, 1, 1, 1, 0, 0, 0, 1): complex(1, -13),
+        (1, 1, 1, 1, 0, 0, 1, 0): complex(1, -11),
+        (1, 1, 1, 1, 0, 0, 1, 1): complex(1, -9),
+        (1, 1, 1, 1, 0, 1, 0, 0): complex(1, -7),
+        (1, 1, 1, 1, 0, 1, 0, 1): complex(1, -5),
+        (1, 1, 1, 1, 0, 1, 1, 0): complex(1, -3),
+        (1, 1, 1, 1, 0, 1, 1, 1): complex(1, -1),
+        (1, 1, 1, 1, 1, 0, 0, 0): complex(1, 1),
+        (1, 1, 1, 1, 1, 0, 0, 1): complex(1, 3),
+        (1, 1, 1, 1, 1, 0, 1, 0): complex(1, 5),
+        (1, 1, 1, 1, 1, 0, 1, 1): complex(1, 7),
+        (1, 1, 1, 1, 1, 1, 0, 0): complex(1, 9),
+        (1, 1, 1, 1, 1, 1, 0, 1): complex(1, 11),
+        (1, 1, 1, 1, 1, 1, 1, 0): complex(1, 13),
+        (1, 1, 1, 1, 1, 1, 1, 1): complex(1, 15),
+    }
+
+    if modulation_mode == '16QAM':
+        modulation_table = modulation_16QAM_table
+        symbol_len = 4
+    elif modulation_mode == '64QAM':
+        modulation_table = modulation_64QAM_table
+        symbol_len = 6
+    elif modulation_mode == '256QAM':
+        modulation_table = modulation_256QAM_table
+        symbol_len = 8
+    elif modulation_mode == '4QAM':
+        modulation_table = modulation_4QAM_table
+        symbol_len = 2
+
+    modulation_bits = bits[:int(len(bits)//symbol_len*symbol_len)]
+    Remainder = bits[int(len(bits)//symbol_len*symbol_len):]
+
+    symbols = []
+    for i in range(0, len(modulation_bits), symbol_len):
+        symbol = modulation_table[tuple(modulation_bits[i:i+symbol_len])]
+        symbols.append(symbol)
+
+    symbols = np.array(symbols)
+    return symbols, modulation_table, Remainder
+
+def add_noise(symbols, snr):
+    # 计算噪声标准差
+    symbols = np.array(symbols, dtype=complex)
+    
+    # # 计算信号的功率
+    signal_power = np.mean(np.abs(symbols)**2)
+    
+    # 计算噪声的功率
+    noise_power = signal_power / (10**(snr / 10))
+    
+    # 计算噪声标准差
+    noise_stddev = np.sqrt(noise_power / 2)  # 因为是复数噪声，所以标准差要除以sqrt(2)
+    
+    # 生成复数形式的高斯噪声
+    noise = (np.random.normal(0, noise_stddev, len(symbols)) +
+             1j * np.random.normal(0, noise_stddev, len(symbols)))
+    
+    # 将噪声添加到符号中
+    symbols_with_noise = symbols + noise
+
+    return symbols_with_noise
+
+def demodulate(symbols_with_noise, modulation_table, Remainder):
+    demodulation_table = {v: k for k, v in modulation_table.items()}
+    bits = []
+    for symbol in symbols_with_noise:
+        # 找到最近的16QAM符号并解调
+        nearest_symbol = min(modulation_table.values(), key=lambda x: abs(x - symbol))
+        bit_quad = demodulation_table[nearest_symbol]
+        bits.extend(bit_quad)
+    bits = np.concatenate((bits, Remainder))
+    return bits

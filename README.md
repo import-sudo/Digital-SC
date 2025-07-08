@@ -19,7 +19,7 @@ The Class **Quantization** in this code can be applied to various tasks such as 
 
 ## 🧠 Citation
 If you use this code in your research, please cite:
-@ARTICLE{10772628,\\
+@ARTICLE{10772628,
   author={Guo, Lei and Chen, Wei and Sun, Yuxuan and Ai, Bo},
   journal={IEEE Transactions on Cognitive Communications and Networking}, 
   title={\protect{Digital-SC}: Digital Semantic Communication With Adaptive Network Split and Learned Non-Linear Quantization}, 
